@@ -17,9 +17,12 @@
 import sys
 import math
 import random
+import json
+import threading
+import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QPoint, QTimer
+from PySide6.QtCore import Qt, QObject, QPoint, QTimer, Signal
 from PySide6.QtGui import QPixmap, QImage, QMouseEvent, QKeyEvent, QAction
 from PySide6.QtWidgets import QApplication, QWidget, QLabel, QMenu
 
@@ -61,6 +64,77 @@ STATES = {
     },
 }
 IDLE_PROGRAMS = ["flute", "yawn", "chair"]
+
+# ---- 天气播报（数据源：Open-Meteo，和 weather-now 网站同款接口）----
+CITY = {"name": "广州", "lat": 23.1291, "lon": 113.2644}
+
+# WMO 天气码 -> (描述, emoji)
+# 【刳云的作业】照 weather-now/main.js 里的 WEATHER_MAP 把剩下的补齐！
+# JS 的对象 {} 在 Python 里叫字典 dict，几乎长得一样；
+# JS 的数组 [a, b] 在这里写成元组 (a, b) 就行
+WEATHER_MAP = {
+    0: ("晴", "☀️"),
+    1: ("大致晴朗", "🌤️"),
+    2: ("局部多云", "⛅"),
+    3: ("阴", "☁️"),
+    45: ("雾", "🌫️"),
+    48: ("冻雾", "🌫️"),
+    51: ("小毛毛雨", "🌦️"),
+    53: ("毛毛雨", "🌦️"),
+    55: ("大毛毛雨", "🌦️"),
+    56: ("冻毛毛雨", "🌧️"),
+    57: ("强冻毛毛雨", "🌧️"),
+    61: ("小雨", "🌧️"),
+    63: ("中雨", "🌧️"),
+    65: ("大雨", "🌧️"),
+    66: ("冻雨", "🌧️"),
+    67: ("强冻雨", "🌧️"),
+    71: ("小雪", "🌨️"),
+    73: ("中雪", "❄️"),
+    75: ("大雪", "❄️"),
+    77: ("雪粒", "❄️"),
+    80: ("小阵雨", "🌦️"),
+    81: ("阵雨", "🌧️"),
+    82: ("强阵雨", "⛈️"),  
+    85: ("小阵雪", "🌨️"),
+    86: ("大阵雪", "🌨️"),
+    95: ("雷暴", "⛈️"),
+    96: ("雷暴伴冰雹", "⛈️"),
+    99: ("强雷暴伴冰雹", "⛈️"),
+}
+
+
+def fetch_weather() -> dict:
+    """问 Open-Meteo 要广州现在的天气。
+
+    对照 weather-now 的 fetchWeather：JS 的 fetch 在 Python 里
+    可以用标准库 urllib；返回的 JSON 文本用 json.loads 变成字典。
+    """
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={CITY['lat']}&longitude={CITY['lon']}"
+        "&current=temperature_2m,relative_humidity_2m,"
+        "apparent_temperature,is_day,weather_code,wind_speed_10m"
+        "&timezone=auto"
+    )
+    with urllib.request.urlopen(url, timeout=10) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
+class WeatherWorker(QObject):
+    """后台线程跑网络请求，完了用 Signal 把结果扔回主线程。
+
+    为什么要线程：网络请求要等零点几秒，如果在主线程里干等，
+    小K 的动画会整个卡住——这就是 JS 里 await 在 Python 桌面的对应解。
+    """
+    done = Signal(dict)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            self.done.emit(fetch_weather())
+        except Exception as exc:  # 超时、断网都走这里
+            self.failed.emit(str(exc))
 
 # ---- 视频动作（video_to_frames.py 生成，每帧已是 213×240 显示尺寸）----
 # 扫描 assets/vid_* 目录自动注册，fps 默认 24
@@ -303,10 +377,58 @@ class PetWindow(QWidget):
                 )
                 menu.addAction(act)
             menu.addSeparator()
+        action_weather = QAction("报天气", self)
+        action_weather.triggered.connect(self.report_weather)
+        menu.addAction(action_weather)
+        menu.addSeparator()
         action_quit = QAction("退出小K", self)
         action_quit.triggered.connect(self.close)
         menu.addAction(action_quit)
         menu.exec(global_pos)
+
+    # ================= 天气播报 =================
+
+    def report_weather(self):
+        """菜单点"报天气"：先给个反应，再去后台查。"""
+        self.show_bubble("我去看看外面的天…", ms=2500)
+        self._worker = WeatherWorker()
+        self._worker.done.connect(self.on_weather)
+        self._worker.failed.connect(
+            lambda msg: self.show_bubble(f"网络开小差了：{msg}")
+        )
+        threading.Thread(target=self._worker.run, daemon=True).start()
+
+    def on_weather(self, data: dict):
+        """拿到天气数据：查 WEATHER_MAP 翻译天气码，拼一句人话。"""
+        cur = data["current"]
+        desc, emoji = WEATHER_MAP.get(cur["weather_code"], ("未知", "❓"))
+        temp = round(cur["temperature_2m"])
+        feels = round(cur["apparent_temperature"])
+        humidity = cur["relative_humidity_2m"]
+        self.show_bubble(
+            f"{CITY['name']}现在{desc} {emoji}\n"
+            f"{temp}°（体感 {feels}°）  湿度 {humidity}%"
+        )
+
+    def show_bubble(self, text: str, ms: int = 8000):
+        """在头顶吹一个白底圆角气泡，ms 毫秒后自动破掉。"""
+        bubble = QLabel(text)
+        bubble.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        bubble.setStyleSheet(
+            "background: white; color: #333; border-radius: 12px;"
+            "padding: 10px 14px; font-size: 14px;"
+            'font-family: "Microsoft YaHei", "Segoe UI Emoji";'
+        )
+        bubble.adjustSize()
+        bubble.move(
+            self.x() + self.width() // 2 - bubble.width() // 2,
+            max(0, self.y() - bubble.height() - 12),
+        )
+        bubble.show()
+        QTimer.singleShot(ms, bubble.close)
+        self._bubble = bubble  # 抓住引用，别被垃圾回收提前收走
 
 
 def main():
